@@ -2,7 +2,7 @@
 # ============================================================
 #  KVM AutoSetup — Interactive VM Provisioning System
 #  Usage: sudo bash kvm-autosetup.sh
-#  v1.2.0 — Docker Compose ready stacks, fe+be combined VM
+#  v1.0.0 — Docker Compose ready stacks, fe+be combined VM
 # ============================================================
 
 set -euo pipefail
