@@ -58,7 +58,7 @@ banner() {
   ██║  ██╗ ╚████╔╝ ██║ ╚═╝ ██║    ██║  ██║╚██████╔╝   ██║   ╚██████╔╝
   ╚═╝  ╚═╝  ╚═══╝  ╚═╝     ╚═╝    ╚═╝  ╚═╝ ╚═════╝    ╚═╝    ╚═════╝
 EOF
-  echo -e "${RESET}${DIM}  KVM Automated VM Provisioning System  •  v1.2.0${RESET}"
+  echo -e "${RESET}${DIM}  KVM Automated VM Provisioning System  •  v1.0.0${RESET}"
   echo -e "${DIM}  ──────────────────────────────────────────────────────${RESET}"
   echo -e "  ${DIM}by ${RESET}${CYAN}${BOLD}Koroya${RESET}"
   echo
