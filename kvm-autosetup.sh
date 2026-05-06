@@ -2,7 +2,7 @@
 # ============================================================
 #  KVM AutoSetup — Interactive VM Provisioning System
 #  Usage: sudo bash kvm-autosetup.sh
-#  v1.1.0 — Added OS detection/selection + flexible VM specs
+#  v1.2.0 — Docker Compose ready stacks, fe+be combined VM
 # ============================================================
 
 set -euo pipefail
@@ -58,7 +58,7 @@ banner() {
   ██║  ██╗ ╚████╔╝ ██║ ╚═╝ ██║    ██║  ██║╚██████╔╝   ██║   ╚██████╔╝
   ╚═╝  ╚═╝  ╚═══╝  ╚═╝     ╚═╝    ╚═╝  ╚═╝ ╚═════╝    ╚═╝    ╚═════╝
 EOF
-  echo -e "${RESET}${DIM}  KVM Automated VM Provisioning System  •  v1.0.0${RESET}"
+  echo -e "${RESET}${DIM}  KVM Automated VM Provisioning System  •  v1.2.0${RESET}"
   echo -e "${DIM}  ──────────────────────────────────────────────────────${RESET}"
   echo -e "  ${DIM}by ${RESET}${CYAN}${BOLD}Koroya${RESET}"
   echo
@@ -356,6 +356,7 @@ check_deps() {
 declare -A ROLE_LABELS=(
   [fe]="Frontend"
   [be]="Backend"
+  [febe]="Frontend + Backend (1 VM)"
   [db]="Database"
   [monitoring]="Monitoring (Wazuh/Grafana)"
   [lb]="Load Balancer / Nginx"
@@ -367,8 +368,16 @@ step_select_roles() {
   section "Langkah 1: Pilih Role VM"
   info "Role yang tersedia:"
   echo
-  local role_list=("Frontend" "Backend" "Database" "Monitoring (Wazuh/Grafana)" "Load Balancer / Nginx" "Client / Admin")
-  local role_keys=("fe" "be" "db" "monitoring" "lb" "client")
+  local role_list=(
+    "Frontend"
+    "Backend"
+    "Frontend + Backend (1 VM)"
+    "Database"
+    "Monitoring (Wazuh/Grafana)"
+    "Load Balancer / Nginx"
+    "Client / Admin"
+  )
+  local role_keys=("fe" "be" "febe" "db" "monitoring" "lb" "client")
 
   local chosen
   chosen=$(pick_many "Pilih role VM yang ingin dibuat:" "${role_list[@]}")
@@ -446,22 +455,29 @@ step_configure_roles() {
     read -r vname < /dev/tty; vname="${vname:-vm-${role}}"
     VM_CONFIG["${role}_name"]="$vname"
 
-    # Spesifikasi fleksibel (fitur baru)
+    # Spesifikasi fleksibel
     _ask_vm_specs "$role"
 
     printf "  \\033[1mIP Address statis (kosongkan untuk DHCP) [contoh: 192.168.122.10]: \\033[0m" > /dev/tty
     read -r ip < /dev/tty
     VM_CONFIG["${role}_ip"]="${ip:-dhcp}"
 
-    local mode
-    mode=$(pick_one "Mode setup VM:" \
-      "VM kosong (fresh install)" \
-      "VM dengan Docker saja" \
-      "VM dengan stack langsung ter-install")
-    VM_CONFIG["${role}_mode"]="$mode"
-
-    if [[ "$mode" != "VM kosong (fresh install)" ]]; then
+    # febe: mode otomatis stack+docker, skip pilih mode
+    if [[ "$role" == "febe" ]]; then
+      VM_CONFIG["${role}_mode"]="VM dengan stack langsung ter-install"
+      VM_CONFIG["${role}_docker"]="true"
       _select_stack "$role"
+    else
+      local mode
+      mode=$(pick_one "Mode setup VM:" \
+        "VM kosong (fresh install)" \
+        "VM dengan Docker saja" \
+        "VM dengan stack langsung ter-install")
+      VM_CONFIG["${role}_mode"]="$mode"
+
+      if [[ "$mode" != "VM kosong (fresh install)" ]]; then
+        _select_stack "$role"
+      fi
     fi
 
     ok "Konfigurasi ${ROLE_LABELS[$role]} selesai"
@@ -484,6 +500,15 @@ _select_stack() {
       tech=$(pick_one "Pilih teknologi Backend:" "Node.js (Express)" "Node.js (NestJS)" "Laravel (PHP)" "Django (Python)" "FastAPI (Python)" "Spring Boot (Java)" "Go (Gin)")
       VM_CONFIG["be_tech"]="$tech"
       ask_yn "Gunakan Docker untuk $tech?" && VM_CONFIG["be_docker"]="true" || VM_CONFIG["be_docker"]="false"
+      ;;
+    febe)
+      local fe_tech be_tech
+      fe_tech=$(pick_one "Pilih teknologi Frontend:" "React" "Vue" "Angular" "Next.js" "Nuxt.js" "Static HTML/Nginx")
+      VM_CONFIG["febe_fe_tech"]="$fe_tech"
+      be_tech=$(pick_one "Pilih teknologi Backend:" "Node.js (Express)" "Node.js (NestJS)" "Laravel (PHP)" "Django (Python)" "FastAPI (Python)" "Spring Boot (Java)" "Go (Gin)")
+      VM_CONFIG["febe_be_tech"]="$be_tech"
+      VM_CONFIG["febe_docker"]="true"
+      info "VM Fe+Be akan menggunakan Docker Compose (fe & be dalam 1 VM)"
       ;;
     db)
       local tech
@@ -686,6 +711,7 @@ _generate_user_data() {
     *"Docker saja"*)
       extra_pkgs=$(_docker_pkg)
       runcmds+=("systemctl enable --now docker")
+      runcmds+=("usermod -aG docker ${default_user}")
       ;;
     *"stack langsung"*)
       _build_stack_cmds "$role"
@@ -725,7 +751,65 @@ EOF
   # Arch Linux: sync package DB dulu sebelum install
   [[ "$TARGET_OS" == "arch" ]] && arch_sync="  - pacman -Syu --noconfirm"$'\n'
 
-  # Tulis user-data
+  # ── Build write_files section untuk docker-compose ───────────
+  local write_files_yaml=""
+  if [[ "$use_docker" == "true" ]] && [[ "$mode" == *"stack langsung"* ]]; then
+    local compose_content="" compose_dir=""
+
+    case "$role" in
+      monitoring)
+        compose_dir="/home/${default_user}/monitoring"
+        case "$tech" in
+          "Wazuh (SIEM)")
+            compose_content=$(_compose_wazuh) ;;
+          "Grafana + Prometheus")
+            compose_content=$(_compose_grafana_prometheus)
+            # tambah prometheus.yml juga
+            local prom_config; prom_config=$(_compose_prometheus_config)
+            local prom_b64; prom_b64=$(echo "$prom_config" | base64 -w0)
+            write_files_yaml+="  - path: ${compose_dir}/prometheus.yml"$'\n'
+            write_files_yaml+="    encoding: b64"$'\n'
+            write_files_yaml+="    content: ${prom_b64}"$'\n'
+            write_files_yaml+="    owner: ${default_user}:${default_user}"$'\n'
+            write_files_yaml+="    permissions: '0644'"$'\n'
+            ;;
+          "Zabbix")
+            compose_content=$(_compose_zabbix) ;;
+        esac
+        ;;
+      febe)
+        compose_dir="/home/${default_user}/febe"
+        local fe_t="${VM_CONFIG[febe_fe_tech]:-React}"
+        local be_t="${VM_CONFIG[febe_be_tech]:-Node.js (Express)}"
+        compose_content=$(_compose_febe "$fe_t" "$be_t")
+        ;;
+    esac
+
+    if [[ -n "$compose_content" && -n "$compose_dir" ]]; then
+      local compose_b64; compose_b64=$(echo "$compose_content" | base64 -w0)
+      write_files_yaml+="  - path: ${compose_dir}/docker-compose.yml"$'\n'
+      write_files_yaml+="    encoding: b64"$'\n'
+      write_files_yaml+="    content: ${compose_b64}"$'\n'
+      write_files_yaml+="    owner: ${default_user}:${default_user}"$'\n'
+      write_files_yaml+="    permissions: '0644'"$'\n'
+    fi
+  fi
+
+  local write_files_section=""
+  [[ -n "$write_files_yaml" ]] && write_files_section="write_files:
+${write_files_yaml}"
+
+  # ── Tulis user-data ──────────────────────────────────────────
+  # Tentukan tech label untuk febe
+  local tech_label="$tech"
+  if [[ "$role" == "febe" ]]; then
+    tech_label="${VM_CONFIG[febe_fe_tech]:-?} + ${VM_CONFIG[febe_be_tech]:-?}"
+  fi
+
+  # groups: tambah docker jika pakai docker
+  local user_groups="sudo, adm"
+  [[ "$use_docker" == "true" || "$role" == "febe" ]] && user_groups="sudo, adm, docker"
+
   cat > "$ci_dir/user-data" <<YAML
 #cloud-config
 hostname: $name
@@ -736,7 +820,7 @@ users:
   - name: $default_user
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
-    groups: [sudo, adm$([ "$use_docker" = "true" ] && echo ", docker")]
+    groups: [$user_groups]
     lock_passwd: false
     passwd: \$6\$rounds=4096\$saltsalt\$$(echo "ubuntu" | openssl passwd -6 -stdin 2>/dev/null || echo '$6$abc$xyz')
 $([ -n "$ssh_key" ] && printf "    ssh_authorized_keys:\n      - %s\n" "$ssh_key")
@@ -746,6 +830,7 @@ package_upgrade: false
 packages:
 $base_pkgs
 $extra_pkg_yaml
+${write_files_section}
 runcmd:
 $arch_sync  - systemctl enable --now qemu-guest-agent
 $runcmd_yaml  - echo "VM $name setup completed at \$(date)" >> /var/log/cloud-init-custom.log
@@ -755,24 +840,279 @@ final_message: |
   OS    : $TARGET_OS_LABEL
   User  : $default_user
   Mode  : $mode
-  Stack : ${tech:-minimal}
+  Stack : ${tech_label:-minimal}
 YAML
 }
 
 _PKG_LIST=""
 _RUN_CMDS=""
 
+# ── Helper: docker usermod + compose dir setup ───────────────
+_docker_base_cmds() {
+  local user="$1" project_dir="$2"
+  echo "systemctl enable --now docker|usermod -aG docker ${user}|mkdir -p ${project_dir}|chown ${user}:${user} ${project_dir}"
+}
+
+# ── Helper: tulis docker-compose.yml ke ci_dir, nanti di-copy via cloud-init ──
+_write_compose_file() {
+  local ci_dir="$1" filename="$2" content="$3"
+  mkdir -p "$ci_dir/compose"
+  printf '%s' "$content" > "$ci_dir/compose/$filename"
+}
+
+# ── Generate compose YAML strings ────────────────────────────
+
+_compose_wazuh() {
+cat <<'COMPOSE'
+services:
+  wazuh.manager:
+    image: wazuh/wazuh-manager:4.7.3
+    hostname: wazuh.manager
+    restart: always
+    ports:
+      - "1514:1514"
+      - "1515:1515"
+      - "514:514/udp"
+      - "55000:55000"
+    environment:
+      - INDEXER_URL=https://wazuh.indexer:9200
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=SecretPassword
+      - FILEBEAT_SSL_VERIFICATION_MODE=full
+    volumes:
+      - wazuh_api_configuration:/var/ossec/api/configuration
+      - wazuh_etc:/var/ossec/etc
+      - wazuh_logs:/var/ossec/logs
+      - wazuh_queue:/var/ossec/queue
+      - wazuh_var_multigroups:/var/ossec/var/multigroups
+      - wazuh_integrations:/var/ossec/integrations
+      - wazuh_active_response:/var/ossec/active-response/bin
+      - wazuh_agentless:/var/ossec/agentless
+      - wazuh_wodles:/var/ossec/wodles
+      - filebeat_etc:/etc/filebeat
+      - filebeat_var:/var/lib/filebeat
+
+  wazuh.indexer:
+    image: wazuh/wazuh-indexer:4.7.3
+    hostname: wazuh.indexer
+    restart: always
+    ports:
+      - "9200:9200"
+    environment:
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+    volumes:
+      - wazuh-indexer-data:/var/lib/wazuh-indexer
+
+  wazuh.dashboard:
+    image: wazuh/wazuh-dashboard:4.7.3
+    hostname: wazuh.dashboard
+    restart: always
+    ports:
+      - "443:5601"
+    environment:
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=SecretPassword
+      - WAZUH_API_URL=https://wazuh.manager
+      - DASHBOARD_USERNAME=kibanaserver
+      - DASHBOARD_PASSWORD=kibanaserver
+      - API_USERNAME=wazuh-wui
+      - API_PASSWORD=MyS3cr3tPassw0rd!
+    depends_on:
+      - wazuh.indexer
+    links:
+      - wazuh.indexer:wazuh.indexer
+      - wazuh.manager:wazuh.manager
+
+volumes:
+  wazuh_api_configuration:
+  wazuh_etc:
+  wazuh_logs:
+  wazuh_queue:
+  wazuh_var_multigroups:
+  wazuh_integrations:
+  wazuh_active_response:
+  wazuh_agentless:
+  wazuh_wodles:
+  filebeat_etc:
+  filebeat_var:
+  wazuh-indexer-data:
+COMPOSE
+}
+
+_compose_grafana_prometheus() {
+cat <<'COMPOSE'
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    restart: always
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    restart: always
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+
+volumes:
+  prometheus_data:
+  grafana_data:
+COMPOSE
+}
+
+_compose_prometheus_config() {
+cat <<'CONF'
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+CONF
+}
+
+_compose_zabbix() {
+cat <<'COMPOSE'
+services:
+  zabbix-db:
+    image: mysql:8.0
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: zabbix_root
+      MYSQL_DATABASE: zabbix
+      MYSQL_USER: zabbix
+      MYSQL_PASSWORD: zabbix_pass
+    volumes:
+      - zabbix_db_data:/var/lib/mysql
+
+  zabbix-server:
+    image: zabbix/zabbix-server-mysql:ubuntu-6.4-latest
+    restart: always
+    ports:
+      - "10051:10051"
+    environment:
+      DB_SERVER_HOST: zabbix-db
+      MYSQL_DATABASE: zabbix
+      MYSQL_USER: zabbix
+      MYSQL_PASSWORD: zabbix_pass
+      MYSQL_ROOT_PASSWORD: zabbix_root
+    depends_on:
+      - zabbix-db
+
+  zabbix-web:
+    image: zabbix/zabbix-web-nginx-mysql:ubuntu-6.4-latest
+    restart: always
+    ports:
+      - "80:8080"
+      - "443:8443"
+    environment:
+      ZBX_SERVER_HOST: zabbix-server
+      DB_SERVER_HOST: zabbix-db
+      MYSQL_DATABASE: zabbix
+      MYSQL_USER: zabbix
+      MYSQL_PASSWORD: zabbix_pass
+      PHP_TZ: Asia/Jakarta
+    depends_on:
+      - zabbix-server
+
+volumes:
+  zabbix_db_data:
+COMPOSE
+}
+
+_compose_febe() {
+  local fe_tech="$1" be_tech="$2"
+  local fe_port="3000" be_port="5000"
+  local fe_image="node:20-alpine" be_image="node:20-alpine"
+
+  case "$be_tech" in
+    "Laravel"*)   be_image="php:8.2-fpm"; be_port="9000" ;;
+    "Django"*|"FastAPI"*) be_image="python:3.11-slim"; be_port="8000" ;;
+    "Spring Boot"*) be_image="eclipse-temurin:17-jre"; be_port="8080" ;;
+    "Go"*)        be_image="golang:1.22-alpine"; be_port="8080" ;;
+  esac
+
+cat <<COMPOSE
+services:
+  frontend:
+    image: ${fe_image}
+    restart: always
+    working_dir: /app
+    ports:
+      - "${fe_port}:${fe_port}"
+    volumes:
+      - ./frontend:/app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    environment:
+      - NODE_ENV=development
+      - VITE_API_URL=http://localhost:${be_port}
+
+  backend:
+    image: ${be_image}
+    restart: always
+    working_dir: /app
+    ports:
+      - "${be_port}:${be_port}"
+    volumes:
+      - ./backend:/app
+    command: sh -c "npm install && npm run dev"
+    environment:
+      - NODE_ENV=development
+      - PORT=${be_port}
+
+networks:
+  default:
+    driver: bridge
+COMPOSE
+}
+
+# ── Main build stack cmds ─────────────────────────────────────
 _build_stack_cmds() {
   local role="$1"
   local tech="${VM_CONFIG[${role}_tech]:-}"
   local use_docker="${VM_CONFIG[${role}_docker]:-false}"
   _PKG_LIST=""; _RUN_CMDS=""
   local dpkg; dpkg=$(_docker_pkg)
+  local default_user; default_user=$(_default_user)
 
   case "$role" in
     fe)
       if [[ "$use_docker" == "true" ]]; then
-        _PKG_LIST="$dpkg nginx"; _RUN_CMDS="systemctl enable --now docker|systemctl enable --now nginx"
+        local project_dir="/home/${default_user}/frontend"
+        _PKG_LIST="$dpkg"
+        _RUN_CMDS="$(_docker_base_cmds "$default_user" "$project_dir")"
       else
         case "$tech" in
           React*|Vue*|Angular*|"Next.js"*|"Nuxt.js"*)
@@ -781,9 +1121,12 @@ _build_stack_cmds() {
             _PKG_LIST="nginx"; _RUN_CMDS="systemctl enable --now nginx" ;;
         esac
       fi ;;
+
     be)
       if [[ "$use_docker" == "true" ]]; then
-        _PKG_LIST="$dpkg"; _RUN_CMDS="systemctl enable --now docker"
+        local project_dir="/home/${default_user}/backend"
+        _PKG_LIST="$dpkg"
+        _RUN_CMDS="$(_docker_base_cmds "$default_user" "$project_dir")"
       else
         case "$tech" in
           "Node.js"*)
@@ -792,7 +1135,7 @@ _build_stack_cmds() {
             case "$TARGET_OS" in
               arch) _PKG_LIST="php composer nginx" ;;
               rhel) _PKG_LIST="php php-fpm php-mbstring php-xml php-curl composer nginx" ;;
-              *)    _PKG_LIST="php8.1 php8.1-fpm php8.1-mbstring php8.1-xml php8.1-curl composer nginx" ;;
+              *)    _PKG_LIST="php8.2 php8.2-fpm php8.2-mbstring php8.2-xml php8.2-curl composer nginx" ;;
             esac
             _RUN_CMDS="systemctl enable --now php-fpm|systemctl enable --now nginx" ;;
           "Django"*|"FastAPI"*)
@@ -811,10 +1154,19 @@ _build_stack_cmds() {
             _PKG_LIST="go" ;;
         esac
       fi ;;
+
+    febe)
+      local project_dir="/home/${default_user}/febe"
+      _PKG_LIST="$dpkg"
+      _RUN_CMDS="$(_docker_base_cmds "$default_user" "$project_dir")|mkdir -p ${project_dir}/frontend ${project_dir}/backend|chown -R ${default_user}:${default_user} ${project_dir}"
+      ;;
+
     db)
       local dbpass="${VM_CONFIG[db_pass]:-Admin1234!}"
       if [[ "$use_docker" == "true" ]]; then
-        _PKG_LIST="$dpkg"; _RUN_CMDS="systemctl enable --now docker"
+        local project_dir="/home/${default_user}/database"
+        _PKG_LIST="$dpkg"
+        _RUN_CMDS="$(_docker_base_cmds "$default_user" "$project_dir")"
       else
         case "$tech" in
           "MySQL 8")
@@ -845,7 +1197,7 @@ enabled=1' > /etc/yum.repos.d/mongodb-org.repo|dnf install -y mongodb-org|system
                 _RUN_CMDS="curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | gpg -o /usr/share/keyrings/mongodb-server-7.0.gpg --dearmor|echo 'deb [ arch=amd64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse' > /etc/apt/sources.list.d/mongodb-org-7.0.list|apt-get update -qq|apt-get install -y mongodb-org|systemctl enable --now mongod" ;;
             esac ;;
           "MariaDB")
-            _PKG_LIST="mariadb"
+            _PKG_LIST="mariadb-server"
             case "$TARGET_OS" in
               arch) _RUN_CMDS="systemctl enable --now mariadb|mariadb-install-db --user=mysql --basedir=/usr --datadir=/var/lib/mysql|mysql -e \"ALTER USER 'root'@'localhost' IDENTIFIED BY '$dbpass'; FLUSH PRIVILEGES;\"" ;;
               *)    _RUN_CMDS="systemctl enable --now mariadb|mysql -e \"ALTER USER 'root'@'localhost' IDENTIFIED BY '$dbpass'; FLUSH PRIVILEGES;\"" ;;
@@ -854,9 +1206,12 @@ enabled=1' > /etc/yum.repos.d/mongodb-org.repo|dnf install -y mongodb-org|system
             _PKG_LIST="redis"; _RUN_CMDS="systemctl enable --now redis" ;;
         esac
       fi ;;
+
     monitoring)
+      local project_dir="/home/${default_user}/monitoring"
       if [[ "$use_docker" == "true" ]]; then
-        _PKG_LIST="$dpkg"; _RUN_CMDS="systemctl enable --now docker"
+        _PKG_LIST="$dpkg"
+        _RUN_CMDS="$(_docker_base_cmds "$default_user" "$project_dir")"
       else
         case "$tech" in
           "Wazuh (SIEM)")
@@ -867,11 +1222,17 @@ enabled=1' > /etc/yum.repos.d/mongodb-org.repo|dnf install -y mongodb-org|system
             _RUN_CMDS="systemctl enable --now prometheus|systemctl enable --now grafana-server" ;;
           "Netdata")
             _RUN_CMDS="bash <(curl -Ss https://my-netdata.io/kickstart.sh) --dont-wait" ;;
+          "Zabbix")
+            _PKG_LIST="zabbix-server-mysql zabbix-frontend-php zabbix-nginx-conf zabbix-agent"
+            _RUN_CMDS="systemctl enable --now zabbix-server zabbix-agent nginx php-fpm" ;;
         esac
       fi ;;
+
     lb)
       if [[ "$use_docker" == "true" ]]; then
-        _PKG_LIST="$dpkg"; _RUN_CMDS="systemctl enable --now docker"
+        local project_dir="/home/${default_user}/loadbalancer"
+        _PKG_LIST="$dpkg"
+        _RUN_CMDS="$(_docker_base_cmds "$default_user" "$project_dir")"
       else
         case "$tech" in
           "Nginx")  _PKG_LIST="nginx";   _RUN_CMDS="systemctl enable --now nginx" ;;
@@ -884,8 +1245,13 @@ enabled=1' > /etc/yum.repos.d/mongodb-org.repo|dnf install -y mongodb-org|system
                 _PKG_LIST="debian-keyring debian-archive-keyring apt-transport-https curl"
                 _RUN_CMDS="curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg|apt-get update -qq && apt-get install -y caddy|systemctl enable --now caddy" ;;
             esac ;;
+          "Traefik")
+            local project_dir="/home/${default_user}/traefik"
+            _PKG_LIST="$dpkg"
+            _RUN_CMDS="$(_docker_base_cmds "$default_user" "$project_dir")" ;;
         esac
       fi ;;
+
     client)
       case "${VM_CONFIG[client_tech]:-}" in
         "Desktop GUI"*)
@@ -897,8 +1263,9 @@ enabled=1' > /etc/yum.repos.d/mongodb-org.repo|dnf install -y mongodb-org|system
         "Cockpit"*)
           _PKG_LIST="cockpit"; _RUN_CMDS="systemctl enable --now cockpit.socket" ;;
         "Portainer"*)
+          local project_dir="/home/${default_user}/portainer"
           _PKG_LIST="$dpkg"
-          _RUN_CMDS="systemctl enable --now docker|docker volume create portainer_data|docker run -d -p 9000:9000 --name portainer --restart always -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data portainer/portainer-ce" ;;
+          _RUN_CMDS="$(_docker_base_cmds "$default_user" "$project_dir")|docker volume create portainer_data|docker run -d -p 9000:9000 --name portainer --restart always -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data portainer/portainer-ce" ;;
       esac ;;
   esac
 }
@@ -942,6 +1309,8 @@ step_summary() {
     "VM Name" "Role" "vCPU" "RAM" "Disk" "IP" "Tech Stack"
   echo "  $(printf '─%.0s' {1..89})"
   for role in "${SELECTED_ROLES[@]}"; do
+    local tech_label="${VM_CONFIG[${role}_tech]:-minimal}"
+    [[ "$role" == "febe" ]] && tech_label="${VM_CONFIG[febe_fe_tech]:-?}+${VM_CONFIG[febe_be_tech]:-?}"
     printf "  %-22s %-16s %-6s %-7s %-8s %-12s %-18s\n" \
       "${VM_CONFIG[${role}_name]}" \
       "${ROLE_LABELS[$role]}" \
@@ -949,7 +1318,7 @@ step_summary() {
       "${VM_CONFIG[${role}_ram_gb]} GB" \
       "${VM_CONFIG[${role}_disk]} GB" \
       "${VM_CONFIG[${role}_ip]}" \
-      "${VM_CONFIG[${role}_tech]:-minimal}"
+      "$tech_label"
   done
 
   echo
@@ -958,6 +1327,34 @@ step_summary() {
   info "  Console SSH      : ${CYAN}ssh $(_default_user)@<IP_VM>${RESET}  (pass: ubuntu)"
   info "  Log provisioning : ${CYAN}$LOG_FILE${RESET}"
   info "  Cloud-init dir   : ${CYAN}$CLOUD_INIT_DIR/${RESET}"
+
+  # Tampilkan info docker-compose per VM yang pakai docker
+  local default_user; default_user=$(_default_user)
+  local shown_header=0
+  for role in "${SELECTED_ROLES[@]}"; do
+    local use_docker="${VM_CONFIG[${role}_docker]:-false}"
+    local mode="${VM_CONFIG[${role}_mode]:-}"
+    if [[ "$use_docker" == "true" && "$mode" == *"stack langsung"* ]] || [[ "$role" == "febe" ]]; then
+      if (( shown_header == 0 )); then
+        echo
+        info "${CYAN}${BOLD}Docker Compose — tinggal jalankan setelah SSH masuk:${RESET}"
+        shown_header=1
+      fi
+      local compose_dir
+      case "$role" in
+        monitoring) compose_dir="/home/${default_user}/monitoring" ;;
+        febe)       compose_dir="/home/${default_user}/febe" ;;
+        fe)         compose_dir="/home/${default_user}/frontend" ;;
+        be)         compose_dir="/home/${default_user}/backend" ;;
+        db)         compose_dir="/home/${default_user}/database" ;;
+        lb)         compose_dir="/home/${default_user}/loadbalancer" ;;
+        *)          compose_dir="/home/${default_user}/${role}" ;;
+      esac
+      echo -e "  ${YELLOW}▸${RESET} ${BOLD}${VM_CONFIG[${role}_name]}${RESET}"
+      echo -e "      ${DIM}ssh ${default_user}@${VM_CONFIG[${role}_ip]}${RESET}"
+      echo -e "      ${CYAN}cd ${compose_dir} && docker compose up -d${RESET}"
+    fi
+  done
   echo
 }
 
@@ -965,6 +1362,7 @@ step_summary() {
 main() {
   require_root
   banner
+  echo -e "  ${DIM}Log: $LOG_FILE${RESET}"
   echo
 
   step_detect_and_select_os  # Step 0: deteksi host OS + pilih OS target
