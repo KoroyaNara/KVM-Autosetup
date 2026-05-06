@@ -4,7 +4,7 @@
 
 ---
 
-## Apa yang Baru di v1.0.0
+## Apa yang ada di v1.0.0
 
 ### 1. Deteksi & Pemilihan OS (fitur baru)
 - **Auto-deteksi OS host** — script membaca `/etc/os-release` dan menentukan package manager yang digunakan untuk install dependensi KVM di host
