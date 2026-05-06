@@ -26,7 +26,7 @@ OS yang didukung sebagai target VM:
 | AlmaLinux 9 | `almalinux9` | repo.almalinux.org |
 | Rocky Linux 9 | `rocky9` | download.rockylinux.org |
 
-### 2. Spesifikasi VM Fleksibel (fitur baru)
+### 2. Spesifikasi VM Fleksibel
 Untuk setiap role VM, user sekarang dapat memilih:
 - Gunakan **default** (2 vCPU, 2 GB RAM, 20 GB Disk), atau
 - Tentukan **custom spec** sendiri:
